@@ -154,6 +154,11 @@
     box-shadow: 0 0 0 1px rgba(232, 196, 74, 0.4), 0 0 24px -4px rgba(232, 196, 74, 0.5);
   }
 
+  .danger-glow {
+    border-color: rgba(232, 74, 74, 0.7) !important;
+    animation: dangerPulse 1.4s ease-in-out infinite;
+  }
+
   .btn-press {
     transition: transform 0.12s ease, box-shadow 0.2s ease, background-color 0.2s ease;
   }

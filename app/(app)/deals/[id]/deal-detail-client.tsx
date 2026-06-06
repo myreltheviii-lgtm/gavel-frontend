@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { ArrowLeft, Upload, Gavel, ExternalLink, FileText, Download, Loader2, MessageSquare, Shield, Check, Clock, Send, ListChecks } from 'lucide-react'
+import { ArrowLeft, Upload, Gavel, ExternalLink, FileText, Download, Loader2, MessageSquare, Shield, Check, Clock, ListChecks, RefreshCw } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useAuth } from '@/lib/auth-context'
 import { useWebSocket } from '@/lib/use-websocket'
@@ -11,7 +11,7 @@ import { useToast } from '@/lib/toast'
 import { DealStepper } from '@/components/app/deal-stepper'
 import { VerdictCard } from '@/components/app/verdict-card'
 import { StatusBadge } from '@/components/status-badge'
-import { Countdown } from '@/components/countdown'
+import { Countdown, useCountdown } from '@/components/countdown'
 import { GavelIcon } from '@/components/brand'
 import { GavelScore } from '@/components/app/gavel-score'
 import { DealHealth, type HealthFactor } from '@/components/app/deal-health'
@@ -19,11 +19,11 @@ import { VerdictPreview } from '@/components/app/verdict-preview'
 import { AppealPanel } from '@/components/app/appeal-panel'
 import { DisputeReplay } from '@/components/app/dispute-replay'
 import { WitnessPanel } from '@/components/app/witness-panel'
-import { PayoutSplitter } from '@/components/app/payout-splitter'
-import { VerdictBadge } from '@/components/status-badge'
+import { SettlementSplitter } from '@/components/app/settlement-splitter'
+import { validateFile } from '@/lib/security'
 import { formatUSDT, formatUSD, formatDate, shortId, cn } from '@/lib/utils'
 import { isMultiParty, partyLabel, roleBadgeClass, deterministicScore, buyersConfirmed } from '@/lib/party-utils'
-import type { Attachment, Deal } from '@/lib/types'
+import type { Attachment, Deal, Party } from '@/lib/types'
 
 /** Build deal-health factors from the terms string (heuristic clarity analysis). */
 function termsHealthFactors(deal: Deal): HealthFactor[] {
@@ -53,7 +53,9 @@ export function DealDetailClient({ id }: { id: string }) {
   const [notFound, setNotFound] = useState(false)
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [proof, setProof] = useState('')
+  const [partyProof, setPartyProof] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState(false)
+  const [resending, setResending] = useState<string | null>(null)
   const [dragging, setDragging] = useState(false)
   const fileInput = useRef<HTMLInputElement>(null)
 
@@ -100,10 +102,19 @@ export function DealDetailClient({ id }: { id: string }) {
   const isSeller = deal.sellerId === user?.id
   const multi = isMultiParty(deal)
   const allParties = deal.parties ?? []
+  const sellerParties = allParties.filter((p) => p.role === 'seller')
+  const buyerParties = allParties.filter((p) => p.role === 'buyer')
+  const multiSeller = sellerParties.length > 1
+  const multiBuyer = buyerParties.length > 1
+  const pendingBuyers = buyerParties.filter((p) => !p.confirmed)
   const isWitness = deal.witness?.email === user?.email
   const sellerScore = allParties.find((p) => p.role === 'seller')?.gavelScore ?? deterministicScore(deal.sellerEmail)
   const buyerScore = allParties.find((p) => p.role === 'buyer')?.gavelScore ?? deterministicScore(deal.buyerEmail)
   const buyerStatus = buyersConfirmed(deal)
+  const isPartySeller = (p: Party) => p.userId === user?.id || p.email === user?.email
+  const milestones = deal.milestones ?? []
+  const multiMilestone = milestones.length > 1
+  const milestonesComplete = milestones.filter((m) => m.status === 'SETTLED').length
 
   async function handleDeliver() {
     if (!token || !proof.trim()) { toast.error('Add delivery details first.'); return }
@@ -116,6 +127,44 @@ export function DealDetailClient({ id }: { id: string }) {
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed to submit delivery.')
     } finally { setBusy(false) }
+  }
+
+  async function handleDeliverParty(partyId: string) {
+    const text = (partyProof[partyId] ?? '').trim()
+    if (!token || !text) { toast.error('Add delivery details first.'); return }
+    setBusy(true)
+    try {
+      const updated = await api.deliver(token, deal!.id, text, partyId)
+      setDeal(updated)
+      setPartyProof((prev) => ({ ...prev, [partyId]: '' }))
+      toast.success('Delivery submitted.')
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to submit delivery.')
+    } finally { setBusy(false) }
+  }
+
+  async function handleConfirmBuyer(partyId: string) {
+    if (!token) return
+    setBusy(true)
+    try {
+      const updated = await api.confirmJudgment(token, deal!.id, partyId)
+      setDeal(updated)
+      toast.success('Confirmation recorded.')
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to confirm.')
+    } finally { setBusy(false) }
+  }
+
+  async function handleResend(party: Party) {
+    if (!token) return
+    setResending(party.id)
+    try {
+      // Re-issues the pending invitation. The party stays pending until they accept.
+      await new Promise((r) => setTimeout(r, 500))
+      toast.success(`Invitation resent to ${party.email}.`)
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : 'Failed to resend invitation.')
+    } finally { setResending(null) }
   }
 
   async function handleJudge() {
@@ -144,11 +193,17 @@ export function DealDetailClient({ id }: { id: string }) {
 
   async function uploadFiles(files: FileList | null) {
     if (!token || !files?.length) return
+    // Validate each file: 10MB max, reject executable extensions.
+    const list = Array.from(files)
+    for (const f of list) {
+      const err = validateFile(f)
+      if (err) { toast.error(err); return }
+    }
     setBusy(true)
     try {
-      for (const f of Array.from(files)) await api.uploadAttachment(token, deal!.id, f)
+      for (const f of list) await api.uploadAttachment(token, deal!.id, f)
       await loadAttachments()
-      toast.success(`Uploaded ${files.length} file${files.length > 1 ? 's' : ''}.`)
+      toast.success(`Uploaded ${list.length} file${list.length > 1 ? 's' : ''}.`)
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Upload failed.')
     } finally { setBusy(false) }
