@@ -46,6 +46,17 @@ export function buyersConfirmed(deal: Pick<Deal, 'parties'>): { confirmed: Party
   }
 }
 
+/**
+ * Deterministic GAVEL score for a counterparty by email/id when an explicit
+ * score is not attached to the record. Stable across renders so the UI never
+ * flickers. Mirrors the backend's scoring range (55-98).
+ */
+export function deterministicScore(emailOrId: string): number {
+  let h = 0
+  for (let i = 0; i < emailOrId.length; i++) h = (h * 31 + emailOrId.charCodeAt(i)) % 1000
+  return 55 + (h % 44)
+}
+
 export function truncateEmail(email: string, max = 22): string {
   if (email.length <= max) return email
   const [name, domain] = email.split('@')

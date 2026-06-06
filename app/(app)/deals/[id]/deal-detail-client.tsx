@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { ArrowLeft, Upload, Gavel, ExternalLink, FileText, Download, Loader2 } from 'lucide-react'
+import { ArrowLeft, Upload, Gavel, ExternalLink, FileText, Download, Loader2, MessageSquare, Shield, Check, Clock } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useAuth } from '@/lib/auth-context'
 import { useWebSocket } from '@/lib/use-websocket'
@@ -13,8 +13,34 @@ import { VerdictCard } from '@/components/app/verdict-card'
 import { StatusBadge } from '@/components/status-badge'
 import { Countdown } from '@/components/countdown'
 import { GavelIcon } from '@/components/brand'
-import { formatUSDT, formatDate, shortId, cn } from '@/lib/utils'
+import { GavelScore } from '@/components/app/gavel-score'
+import { DealHealth, type HealthFactor } from '@/components/app/deal-health'
+import { VerdictPreview } from '@/components/app/verdict-preview'
+import { AppealPanel } from '@/components/app/appeal-panel'
+import { DisputeReplay } from '@/components/app/dispute-replay'
+import { WitnessPanel } from '@/components/app/witness-panel'
+import { formatUSDT, formatUSD, formatDate, shortId, cn } from '@/lib/utils'
+import { isMultiParty, partyLabel, roleBadgeClass, deterministicScore, buyersConfirmed } from '@/lib/party-utils'
 import type { Attachment, Deal } from '@/lib/types'
+
+/** Build deal-health factors from the terms string (heuristic clarity analysis). */
+function termsHealthFactors(deal: Deal): HealthFactor[] {
+  const t = (deal.terms || '').toLowerCase()
+  const len = deal.terms?.length ?? 0
+  const has = (...words: string[]) => words.some((w) => t.includes(w))
+  const score = (ok: boolean) => (ok ? 100 : 25)
+  const factors: HealthFactor[] = [
+    { label: 'Detail & length', value: Math.max(20, Math.min(100, Math.round((len / 280) * 100))), weight: 0.8, detail: 'Longer, specific terms are easier to judge.' },
+    { label: 'Deliverable format', value: score(has('format', 'svg', 'png', 'pdf', 'file', 'repository', 'document')), weight: 1, detail: 'Specifies the file or deliverable format.' },
+    { label: 'Deadline / timeframe', value: score(has('deadline', 'within', 'days', 'timeframe', 'due')), weight: 1, detail: 'States a clear delivery window.' },
+    { label: 'Revision rounds', value: score(has('revision', 'rounds', 'revisions')), weight: 0.7, detail: 'Defines how many revisions are included.' },
+    { label: 'Acceptance criteria', value: score(has('accept', 'criteria', 'must', 'pass', 'match')), weight: 0.9, detail: 'Defines when the work is considered done.' },
+  ]
+  if (isMultiParty(deal) && (deal.parties?.filter((p) => p.role === 'seller').length ?? 0) > 1) {
+    factors.push({ label: 'Per-seller breakdown', value: score(has('seller 1', 'seller 2', 'each seller', 'per-seller')), weight: 0.8, detail: 'Breaks down deliverables per seller.' })
+  }
+  return factors
+}
 
 export function DealDetailClient({ id }: { id: string }) {
   const { user, token } = useAuth()
@@ -70,6 +96,12 @@ export function DealDetailClient({ id }: { id: string }) {
 
   const isBuyer = deal.buyerId === user?.id
   const isSeller = deal.sellerId === user?.id
+  const multi = isMultiParty(deal)
+  const allParties = deal.parties ?? []
+  const isWitness = deal.witness?.email === user?.email
+  const sellerScore = allParties.find((p) => p.role === 'seller')?.gavelScore ?? deterministicScore(deal.sellerEmail)
+  const buyerScore = allParties.find((p) => p.role === 'buyer')?.gavelScore ?? deterministicScore(deal.buyerEmail)
+  const buyerStatus = buyersConfirmed(deal)
 
   async function handleDeliver() {
     if (!token || !proof.trim()) { toast.error('Add delivery details first.'); return }
@@ -144,30 +176,58 @@ export function DealDetailClient({ id }: { id: string }) {
       <header className="mt-8 flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
         <div>
           <h1 className="font-display text-4xl font-medium text-foreground md:text-5xl">{deal.title}</h1>
-          <p className="mt-2 font-mono text-xs uppercase tracking-widest text-muted-foreground">
-            Deal {shortId(deal.id)}
-          </p>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <p className="font-mono text-xs uppercase tracking-widest text-muted-foreground">
+              Deal {shortId(deal.id)}
+            </p>
+            {deal.witness && (
+              <span className="inline-flex items-center gap-1 rounded-full border border-[#a67be8]/40 bg-[#a67be8]/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-[#c9a8f0]">
+                Witnessed
+              </span>
+            )}
+            {deal.insured && (
+              <span className="inline-flex items-center gap-1 rounded-full border border-gold/40 bg-gold/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-gold">
+                <Shield className="h-2.5 w-2.5" /> Insured
+              </span>
+            )}
+          </div>
         </div>
-        <div className="text-right">
-          <div className="font-mono text-3xl font-semibold text-gold">{formatUSDT(deal.amount)}</div>
-          {['LOCKED', 'DELIVERED', 'JUDGING'].includes(deal.status) && (
-            <div className="mt-1 text-sm">
-              <Countdown to={deal.expiresAt} />
-            </div>
-          )}
+        <div className="flex flex-col items-start gap-3 md:items-end">
+          <div className="text-left md:text-right">
+            <div className="font-mono text-3xl font-semibold text-gold">{formatUSDT(deal.amount)}</div>
+            {['LOCKED', 'DELIVERED', 'JUDGING'].includes(deal.status) && (
+              <div className="mt-1 text-sm">
+                <Countdown to={deal.expiresAt} />
+              </div>
+            )}
+          </div>
+          <Link
+            href={`/deals/${deal.id}/room`}
+            className="btn-press inline-flex items-center gap-2 rounded-md border border-border bg-surface/60 px-4 py-2 text-sm text-foreground hover:border-gold/40"
+          >
+            <MessageSquare className="h-4 w-4 text-gold" /> Deal Room
+          </Link>
         </div>
       </header>
 
       <div className="mt-6 grid gap-6 lg:grid-cols-3">
         {/* Left: terms + parties */}
-        <div className="lg:col-span-2">
+        <div className="space-y-6 lg:col-span-2">
           <section className="glass rounded-2xl border border-border p-6">
             <h2 className="font-mono text-xs uppercase tracking-widest text-gold">Deal Terms</h2>
             <p className="mt-3 whitespace-pre-wrap leading-relaxed text-foreground/90">{deal.terms}</p>
           </section>
 
+          {/* Deal Health — LOCKED only */}
+          {deal.status === 'LOCKED' && (
+            <DealHealth factors={termsHealthFactors(deal)} />
+          )}
+
+          {/* Verdict prediction — DELIVERED only, before judgment */}
+          {deal.status === 'DELIVERED' && <VerdictPreview deal={deal} />}
+
           {deal.deliveryProof && (
-            <section className="glass mt-6 rounded-2xl border border-border p-6">
+            <section className="glass rounded-2xl border border-border p-6">
               <h2 className="font-mono text-xs uppercase tracking-widest text-gold">Delivery Proof</h2>
               <p className="mt-3 whitespace-pre-wrap leading-relaxed text-foreground/90">{deal.deliveryProof}</p>
             </section>
@@ -175,26 +235,83 @@ export function DealDetailClient({ id }: { id: string }) {
         </div>
 
         {/* Right: parties + meta */}
-        <aside className="glass h-fit rounded-2xl border border-border p-6">
-          <h2 className="font-mono text-xs uppercase tracking-widest text-gold">Parties</h2>
-          <dl className="mt-4 space-y-4 text-sm">
-            <div>
-              <dt className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">Buyer {isBuyer && '(you)'}</dt>
-              <dd className="mt-0.5 font-mono text-foreground">{deal.buyerEmail}</dd>
-            </div>
-            <div>
-              <dt className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">Seller {isSeller && '(you)'}</dt>
-              <dd className="mt-0.5 font-mono text-foreground">{deal.sellerEmail}</dd>
-            </div>
-            <div>
-              <dt className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">Created</dt>
-              <dd className="mt-0.5 text-foreground/80">{formatDate(deal.createdAt)}</dd>
-            </div>
-            <div>
-              <dt className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">Expires</dt>
-              <dd className="mt-0.5 text-foreground/80">{formatDate(deal.expiresAt)}</dd>
-            </div>
-          </dl>
+        <aside className="h-fit space-y-6">
+          {multi ? (
+            <section className="glass rounded-2xl border border-border p-6">
+              <h2 className="font-mono text-xs uppercase tracking-widest text-gold">
+                Parties ({allParties.length})
+              </h2>
+              <ul className="mt-4 space-y-3">
+                {allParties.map((p) => {
+                  const score = p.gavelScore ?? deterministicScore(p.email)
+                  const you = p.userId === user?.id || p.email === user?.email
+                  return (
+                    <li key={p.id} className="rounded-lg border border-border bg-surface/40 p-3">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className={cn('rounded border px-2 py-0.5 font-mono text-[10px] font-medium uppercase tracking-wider', roleBadgeClass(p.role))}>
+                          {partyLabel(p, allParties)} {you && '· you'}
+                        </span>
+                        <GavelScore score={score} size="sm" animate={false} />
+                      </div>
+                      <p className="mt-2 break-all font-mono text-xs text-foreground/90">{p.email}</p>
+                      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+                        <span>{p.allocation}% · {formatUSD(Math.round((deal.amount * p.allocation) / 100))}</span>
+                        {p.role === 'buyer' && (
+                          <span className={cn('inline-flex items-center gap-1', p.confirmed ? 'text-success' : 'text-amber-300')}>
+                            {p.confirmed ? <Check className="h-3 w-3" /> : <Clock className="h-3 w-3" />}
+                            {p.confirmed ? 'Confirmed' : 'Pending'}
+                          </span>
+                        )}
+                        {p.role === 'seller' && (
+                          <span className={cn('inline-flex items-center gap-1', p.delivered ? 'text-success' : 'text-muted-foreground')}>
+                            {p.delivered ? <Check className="h-3 w-3" /> : <Clock className="h-3 w-3" />}
+                            {p.delivered ? 'Delivered' : 'Awaiting'}
+                          </span>
+                        )}
+                        {p.verdict && <span className="text-gold">{p.verdict}</span>}
+                      </div>
+                    </li>
+                  )
+                })}
+              </ul>
+              {buyerStatus && (
+                <p className="mt-4 border-t border-border pt-3 font-mono text-[11px] uppercase tracking-wider text-muted-foreground">
+                  {buyerStatus.confirmed.length}/{buyerStatus.confirmed.length + buyerStatus.pending.length} buyers confirmed
+                </p>
+              )}
+            </section>
+          ) : (
+            <section className="glass rounded-2xl border border-border p-6">
+              <h2 className="font-mono text-xs uppercase tracking-widest text-gold">Parties</h2>
+              <div className="mt-4 space-y-5 text-sm">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <dt className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">Buyer {isBuyer && '(you)'}</dt>
+                    <dd className="mt-0.5 break-all font-mono text-foreground">{deal.buyerEmail}</dd>
+                  </div>
+                  <GavelScore score={buyerScore} size="sm" animate={false} />
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <dt className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">Seller {isSeller && '(you)'}</dt>
+                    <dd className="mt-0.5 break-all font-mono text-foreground">{deal.sellerEmail}</dd>
+                  </div>
+                  <GavelScore score={sellerScore} size="sm" animate={false} />
+                </div>
+                <div>
+                  <dt className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">Created</dt>
+                  <dd className="mt-0.5 text-foreground/80">{formatDate(deal.createdAt)}</dd>
+                </div>
+                <div>
+                  <dt className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">Expires</dt>
+                  <dd className="mt-0.5 text-foreground/80">{formatDate(deal.expiresAt)}</dd>
+                </div>
+              </div>
+            </section>
+          )}
+
+          {/* Witness panel */}
+          {deal.witness && <WitnessPanel witness={deal.witness} />}
         </aside>
       </div>
 
@@ -268,7 +385,22 @@ export function DealDetailClient({ id }: { id: string }) {
           <div className="space-y-6">
             <VerdictCard key={deal.verdict + deal.confidence} deal={deal} />
 
-            {deal.status === 'JUDGED' && (
+            {/* Reasoning replay + appeal status badge */}
+            <div className="flex flex-wrap items-center justify-center gap-3">
+              <DisputeReplay deal={deal} />
+              {deal.appeal?.resolved && (
+                <span className="inline-flex items-center gap-1.5 rounded-md border border-[#a67be8]/40 bg-[#a67be8]/10 px-3 py-2 font-mono text-xs uppercase tracking-wider text-[#c9a8f0]">
+                  Final Verdict — Appeal Considered
+                </span>
+              )}
+            </div>
+
+            {/* Appeal panel — JUDGED only, hidden for witness (read-only) */}
+            {deal.status === 'JUDGED' && !isWitness && (
+              <AppealPanel deal={deal} onUpdate={(d) => setDeal(d)} />
+            )}
+
+            {deal.status === 'JUDGED' && !isWitness && (
               <div className="flex flex-col items-center gap-3 text-center">
                 <button
                   onClick={handleSettle}

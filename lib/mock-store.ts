@@ -174,6 +174,11 @@ function makeDeal(input: {
     witness: input.witnessEmail
       ? { email: input.witnessEmail, notified: { LOCKED: true, DELIVERED: ['DELIVERED', 'JUDGING', 'JUDGED', 'SETTLED'].includes(input.status), JUDGED: ['JUDGED', 'SETTLED'].includes(input.status), SETTLED: settled } }
       : undefined,
+    // JUDGED deals expose a live 24h appeal window; SETTLED deals' windows have closed.
+    appeal:
+      input.status === 'JUDGED'
+        ? { openedAt: iso(-4 * 3600_000), closesAt: iso(20 * 3600_000), submitted: false, resolved: false }
+        : undefined,
   }
   deal.auditTrail = buildAudit(deal, input.status)
   return deal

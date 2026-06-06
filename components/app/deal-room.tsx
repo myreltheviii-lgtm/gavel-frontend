@@ -78,7 +78,9 @@ export function DealRoom({ deal }: { deal: Deal }) {
     const unsub = subscribeMessages(deal.id, (msg) => {
       setMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]))
     })
-    return unsub
+    return () => {
+      unsub()
+    }
   }, [deal.id])
 
   // Auto-scroll to bottom on new messages.
