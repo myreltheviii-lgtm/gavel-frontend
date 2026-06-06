@@ -3,77 +3,158 @@
 import { useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
-import { ArrowLeft, ArrowRight, Check, Palette, Code, PenLine, FileText, Loader2, Pencil } from 'lucide-react'
+import { ArrowLeft, ArrowRight, Check, Loader2, Pencil, Eye, ListChecks } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useAuth } from '@/lib/auth-context'
 import { useToast } from '@/lib/toast'
 import { TEMPLATES } from '@/lib/mock-store'
+import { sanitizeText, trimInput } from '@/lib/security'
 import { formatUSD, formatDate, cn } from '@/lib/utils'
+import { AgreementBuilder } from '@/components/app/agreement-builder'
+import { PartyManager, makeDefaultParties, partiesValid } from '@/components/app/party-manager'
+import { MilestoneBuilder, type MilestoneDraft } from '@/components/app/milestone-builder'
+import { WitnessInput } from '@/components/app/witness-panel'
+import { InsurancePanel } from '@/components/app/insurance-panel'
+import type { PartyDraft } from '@/components/app/party-card'
+import type { Milestone, Party } from '@/lib/types'
 
-const TEMPLATE_ICONS: Record<string, typeof Palette> = {
-  logo: Palette,
-  web: Code,
-  content: PenLine,
+const STEP_LABELS = ['Agreement', 'Parties', 'Milestones', 'Witness', 'Review']
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+
+function uid(prefix = '') {
+  return prefix + Math.random().toString(36).slice(2, 9)
 }
-
-const STEP_LABELS = ['Template', 'Terms', 'Details', 'Review']
 
 export function NewDealClient() {
   const router = useRouter()
-  const { token } = useAuth()
+  const { token, user } = useAuth()
   const toast = useToast()
   const [step, setStep] = useState(0)
   const [dir, setDir] = useState<'fwd' | 'back'>('fwd')
   const [submitting, setSubmitting] = useState(false)
 
+  // Step 0 — agreement
   const [title, setTitle] = useState('')
   const [terms, setTerms] = useState('')
   const [amount, setAmount] = useState('')
-  const [seller, setSeller] = useState('')
+
+  // Step 1 — parties
+  const [parties, setParties] = useState<PartyDraft[]>(() => makeDefaultParties(user?.email ?? 'you@gavel.court'))
+
+  // Step 2 — milestones (optional)
+  const [milestones, setMilestones] = useState<MilestoneDraft[]>([])
+
+  // Step 3 — witness (optional)
+  const [witnessOn, setWitnessOn] = useState(false)
+  const [witnessEmail, setWitnessEmail] = useState('')
+
+  // Review — insurance (only > $500)
+  const [insured, setInsured] = useState(false)
 
   const expiry = useMemo(() => new Date(Date.now() + 30 * 86_400_000).toISOString(), [])
+  const amountNum = Number(amount) || 0
+
+  const sellers = parties.filter((p) => p.role === 'seller')
+  const buyers = parties.filter((p) => p.role === 'buyer')
+  const isMulti = buyers.length > 1 || sellers.length > 1
+  const sellerOptions = sellers
+    .filter((s) => s.email.trim())
+    .map((s, i) => ({ id: s.id, label: sellers.length > 1 ? `Seller ${i + 1} · ${s.email}` : s.email }))
 
   function go(next: number) {
     setDir(next > step ? 'fwd' : 'back')
     setStep(next)
   }
 
-  function pickTemplate(t?: { name: string; terms: string }) {
-    if (t) {
-      setTitle((cur) => cur || t.name)
-      setTerms(t.terms)
-    }
-    go(1)
+  function quickFill(t: { name: string; terms: string }) {
+    setTitle((cur) => cur || t.name)
+    setTerms(t.terms)
   }
 
   function validateStep(): string | null {
-    if (step === 1) {
+    if (step === 0) {
       if (!title.trim()) return 'Add a deal title.'
-      if (!terms.trim()) return 'Add the deal terms.'
+      if (!terms.trim()) return 'Generate or write the deal terms.'
+      if (!amountNum || amountNum <= 0) return 'Enter a valid amount.'
+    }
+    if (step === 1) {
+      if (!partiesValid(parties)) {
+        return 'Each side needs a valid email and allocations must total exactly 100%.'
+      }
     }
     if (step === 2) {
-      const amt = Number(amount)
-      if (!amt || amt <= 0) return 'Enter a valid amount.'
-      if (!seller.trim()) return 'Enter the seller email or ID.'
+      const partial = milestones.find((m) => (m.title.trim() || m.amount > 0) && !m.title.trim())
+      if (partial) return 'Give every milestone a title, or remove it.'
+    }
+    if (step === 3) {
+      if (witnessOn && !EMAIL_RE.test(witnessEmail.trim())) return 'Enter a valid witness email, or turn the witness off.'
     }
     return null
   }
 
   function next() {
     const err = validateStep()
-    if (err) { toast.error(err); return }
+    if (err) {
+      toast.error(err)
+      return
+    }
     go(step + 1)
+  }
+
+  function buildParties(): Party[] | undefined {
+    if (!isMulti) return undefined
+    return parties.map((p) => {
+      const isCreator = !!p.locked || p.email.trim().toLowerCase() === user?.email?.toLowerCase()
+      return {
+        id: p.id,
+        email: trimInput(p.email),
+        role: p.role,
+        allocation: p.allocation,
+        accepted: isCreator,
+        confirmed: p.role === 'buyer' ? isCreator : undefined,
+        delivered: p.role === 'seller' ? false : undefined,
+      }
+    })
+  }
+
+  function buildMilestones(): Milestone[] | undefined {
+    const valid = milestones.filter((m) => m.title.trim())
+    if (valid.length === 0) return undefined
+    return valid.map((m) => ({
+      id: m.id || uid('m_'),
+      title: m.title.trim(),
+      description: m.description.trim(),
+      amount: m.amount,
+      deadline: m.deadline || expiry,
+      status: 'LOCKED' as const,
+      sellerPartyId: m.sellerPartyId,
+    }))
   }
 
   async function submit() {
     if (!token) return
+    // Re-validate every gated step before locking funds.
+    for (let s = 0; s <= 3; s++) {
+      const err = validateAt(s)
+      if (err) {
+        go(s)
+        toast.error(err)
+        return
+      }
+    }
     setSubmitting(true)
     try {
+      const sellerId = trimInput(sellers[0]?.email ?? '')
       const deal = await api.createDeal(token, {
-        title: title.trim(),
-        terms: terms.trim(),
-        amount: Number(amount),
-        sellerId: seller.trim(),
+        title: trimInput(title),
+        terms: sanitizeText(terms),
+        amount: amountNum,
+        sellerId,
+        parties: buildParties(),
+        milestones: buildMilestones(),
+        witnessEmail: witnessOn ? trimInput(witnessEmail) : undefined,
+        insured: amountNum > 500 ? insured : false,
       })
       toast.success('Deal created and funds locked.')
       router.push(`/deals/${deal.id}`)
@@ -81,6 +162,22 @@ export function NewDealClient() {
       toast.error(e instanceof Error ? e.message : 'Failed to create deal.')
       setSubmitting(false)
     }
+  }
+
+  // Pure validation for an arbitrary step, used by the final submit guard.
+  function validateAt(s: number): string | null {
+    if (s === 0) {
+      if (!title.trim()) return 'Add a deal title.'
+      if (!terms.trim()) return 'Generate or write the deal terms.'
+      if (!amountNum || amountNum <= 0) return 'Enter a valid amount.'
+    }
+    if (s === 1 && !partiesValid(parties)) {
+      return 'Each side needs a valid email and allocations must total exactly 100%.'
+    }
+    if (s === 3 && witnessOn && !EMAIL_RE.test(witnessEmail.trim())) {
+      return 'Enter a valid witness email, or turn the witness off.'
+    }
+    return null
   }
 
   return (
@@ -109,41 +206,15 @@ export function NewDealClient() {
           </div>
         ))}
       </div>
+      <p className="mt-3 font-mono text-[11px] uppercase tracking-widest text-gold">
+        Step {step + 1} — {STEP_LABELS[step]}
+      </p>
 
-      <div className="relative mt-8 overflow-hidden">
+      <div className="relative mt-6 overflow-hidden">
         <div key={step} className={dir === 'fwd' ? 'animate-slide-fwd' : 'animate-slide-back'}>
+          {/* STEP 0 — Agreement */}
           {step === 0 && (
-            <div>
-              <h2 className="font-display text-2xl font-medium text-foreground">Start from a template</h2>
-              <p className="mt-1 text-sm text-muted-foreground">Pick a common deal type or start from scratch.</p>
-              <div className="mt-6 grid gap-4 sm:grid-cols-3">
-                {TEMPLATES.map((t) => {
-                  const Icon = TEMPLATE_ICONS[t.id] ?? FileText
-                  return (
-                    <button
-                      key={t.id}
-                      onClick={() => pickTemplate(t)}
-                      className="glass group flex flex-col items-start gap-3 rounded-xl border border-border p-5 text-left transition-colors hover:border-gold/40"
-                    >
-                      <Icon className="h-7 w-7 text-gold" />
-                      <span className="font-display text-xl font-medium text-foreground">{t.name}</span>
-                      <span className="line-clamp-2 text-xs text-muted-foreground">{t.terms}</span>
-                    </button>
-                  )
-                })}
-              </div>
-              <button
-                onClick={() => pickTemplate()}
-                className="mt-4 w-full rounded-xl border border-dashed border-border py-4 text-sm text-muted-foreground transition-colors hover:border-gold/40 hover:text-foreground"
-              >
-                Start blank
-              </button>
-            </div>
-          )}
-
-          {step === 1 && (
             <div className="space-y-6">
-              <h2 className="font-display text-2xl font-medium text-foreground">Title &amp; terms</h2>
               <div>
                 <label className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">Title</label>
                 <input
@@ -153,6 +224,9 @@ export function NewDealClient() {
                   className="mt-2 w-full border-0 border-b border-border bg-transparent pb-2 text-lg text-foreground outline-none focus:border-gold"
                 />
               </div>
+
+              <AgreementBuilder sellerCount={Math.max(1, sellers.length)} onUse={(t) => setTerms(t)} />
+
               <div>
                 <div className="flex items-center justify-between">
                   <label className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">Terms</label>
@@ -161,17 +235,25 @@ export function NewDealClient() {
                 <textarea
                   value={terms}
                   onChange={(e) => setTerms(e.target.value.slice(0, 2000))}
-                  rows={8}
-                  placeholder="Describe exactly what the seller must deliver, formats, revisions, deadlines…"
+                  rows={7}
+                  placeholder="Generate above, or describe exactly what the seller must deliver, formats, revisions, deadlines…"
                   className="mt-2 w-full rounded-lg border border-border bg-surface/60 p-3 text-foreground outline-none focus:border-gold"
                 />
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">Quick fill:</span>
+                  {TEMPLATES.map((t) => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() => quickFill(t)}
+                      className="rounded-full border border-border px-3 py-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground transition-colors hover:border-gold/40 hover:text-gold"
+                    >
+                      {t.name}
+                    </button>
+                  ))}
+                </div>
               </div>
-            </div>
-          )}
 
-          {step === 2 && (
-            <div className="space-y-6">
-              <h2 className="font-display text-2xl font-medium text-foreground">Amount &amp; counterparty</h2>
               <div>
                 <label className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">Amount (USD / USDT)</label>
                 <div className="mt-2 flex items-center gap-2 border-b border-border focus-within:border-gold">
@@ -186,56 +268,120 @@ export function NewDealClient() {
                   />
                 </div>
               </div>
-              <div>
-                <label className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">Seller email or ID</label>
-                <input
-                  value={seller}
-                  onChange={(e) => setSeller(e.target.value)}
-                  placeholder="seller@example.com"
-                  className="mt-2 w-full border-0 border-b border-border bg-transparent pb-2 text-foreground outline-none focus:border-gold"
-                />
-              </div>
-              <div className="rounded-lg border border-border bg-surface/50 p-4">
-                <span className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">Expires</span>
-                <p className="mt-1 text-foreground">{formatDate(expiry)} <span className="text-muted-foreground">(30 days from today)</span></p>
-              </div>
             </div>
           )}
 
+          {/* STEP 1 — Parties */}
+          {step === 1 && (
+            <PartyManager parties={parties} amount={amountNum} onChange={setParties} />
+          )}
+
+          {/* STEP 2 — Milestones */}
+          {step === 2 && (
+            <div className="space-y-4">
+              <div className="flex items-center gap-2">
+                <ListChecks className="h-5 w-5 text-gold" />
+                <h2 className="font-display text-2xl font-medium text-foreground">Milestones</h2>
+                <span className="ml-auto font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Optional</span>
+              </div>
+              <p className="-mt-2 text-sm text-muted-foreground">
+                Break the deal into phases that release funds independently. Drag to reorder
+                {sellers.length > 1 ? ', and assign each milestone to a seller.' : '.'}
+              </p>
+              <MilestoneBuilder milestones={milestones} onChange={setMilestones} sellerOptions={sellerOptions} />
+            </div>
+          )}
+
+          {/* STEP 3 — Witness */}
           {step === 3 && (
+            <div className="space-y-5">
+              <div className="flex items-center gap-2">
+                <Eye className="h-5 w-5 text-gold" />
+                <h2 className="font-display text-2xl font-medium text-foreground">Witness</h2>
+                <span className="ml-auto font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Optional</span>
+              </div>
+              <div className="glass flex items-center justify-between rounded-lg border border-border p-4">
+                <div className="pr-4">
+                  <p className="font-medium text-foreground">Add a GAVEL Witness</p>
+                  <p className="mt-1 text-sm text-muted-foreground">A neutral third party gets read-only access and stage notifications.</p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={witnessOn}
+                  onClick={() => setWitnessOn((v) => !v)}
+                  className={cn('relative h-6 w-11 shrink-0 rounded-full transition-colors', witnessOn ? 'bg-gold' : 'bg-border')}
+                >
+                  <span className={cn('absolute top-0.5 h-5 w-5 rounded-full bg-background transition-transform', witnessOn ? 'translate-x-5' : 'translate-x-0.5')} />
+                </button>
+              </div>
+              {witnessOn && <WitnessInput value={witnessEmail} onChange={setWitnessEmail} />}
+            </div>
+          )}
+
+          {/* STEP 4 — Review */}
+          {step === 4 && (
             <div className="space-y-4">
               <h2 className="font-display text-2xl font-medium text-foreground">Review &amp; lock</h2>
-              <ReviewRow label="Title" value={title} onEdit={() => go(1)} />
-              <ReviewRow label="Terms" value={terms} onEdit={() => go(1)} multiline />
-              <ReviewRow label="Amount" value={formatUSD(Number(amount))} onEdit={() => go(2)} />
-              <ReviewRow label="Seller" value={seller} onEdit={() => go(2)} />
-              <ReviewRow label="Expires" value={formatDate(expiry)} onEdit={() => go(2)} />
+              <ReviewRow label="Title" value={title} onEdit={() => go(0)} />
+              <ReviewRow label="Terms" value={terms} onEdit={() => go(0)} multiline />
+              <ReviewRow label="Amount" value={formatUSD(amountNum)} onEdit={() => go(0)} />
+              <ReviewRow
+                label={isMulti ? 'Parties' : 'Seller'}
+                value={
+                  isMulti
+                    ? `${buyers.length} buyer${buyers.length === 1 ? '' : 's'} · ${sellers.length} seller${sellers.length === 1 ? '' : 's'}`
+                    : sellers[0]?.email ?? '—'
+                }
+                onEdit={() => go(1)}
+              />
+              {milestones.filter((m) => m.title.trim()).length > 0 && (
+                <ReviewRow
+                  label="Milestones"
+                  value={`${milestones.filter((m) => m.title.trim()).length} phase${milestones.filter((m) => m.title.trim()).length === 1 ? '' : 's'}`}
+                  onEdit={() => go(2)}
+                />
+              )}
+              <ReviewRow label="Witness" value={witnessOn ? witnessEmail : 'None'} onEdit={() => go(3)} />
+              <ReviewRow label="Expires" value={formatDate(expiry)} onEdit={() => go(0)} />
+
+              {/* Insurance — only above $500 */}
+              {amountNum > 500 && (
+                <InsurancePanel
+                  amount={amountNum}
+                  enabled={insured}
+                  onToggle={setInsured}
+                  buyers={isMulti ? buyers.map((b) => ({ email: b.email, allocation: b.allocation })) : undefined}
+                />
+              )}
             </div>
           )}
         </div>
       </div>
 
       {/* Nav */}
-      {step > 0 && (
-        <div className="mt-10 flex items-center justify-between">
-          <button onClick={() => go(step - 1)} className="inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground">
-            <ArrowLeft className="h-4 w-4" /> Back
+      <div className="mt-10 flex items-center justify-between">
+        <button
+          onClick={() => go(step - 1)}
+          disabled={step === 0}
+          className="inline-flex items-center gap-2 text-sm text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
+        >
+          <ArrowLeft className="h-4 w-4" /> Back
+        </button>
+        {step < STEP_LABELS.length - 1 ? (
+          <button onClick={next} className="btn-press inline-flex items-center gap-2 rounded-md bg-gold px-5 py-2.5 text-sm font-medium text-primary-foreground">
+            Continue <ArrowRight className="h-4 w-4" />
           </button>
-          {step < 3 ? (
-            <button onClick={next} className="btn-press inline-flex items-center gap-2 rounded-md bg-gold px-5 py-2.5 text-sm font-medium text-primary-foreground">
-              Continue <ArrowRight className="h-4 w-4" />
-            </button>
-          ) : (
-            <button
-              onClick={submit}
-              disabled={submitting}
-              className="btn-press inline-flex items-center gap-2 rounded-md bg-gold px-6 py-3 text-sm font-medium text-primary-foreground gold-glow disabled:opacity-60"
-            >
-              {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : null} Create Deal &amp; Lock Funds
-            </button>
-          )}
-        </div>
-      )}
+        ) : (
+          <button
+            onClick={submit}
+            disabled={submitting}
+            className="btn-press inline-flex items-center gap-2 rounded-md bg-gold px-6 py-3 text-sm font-medium text-primary-foreground gold-glow disabled:opacity-60"
+          >
+            {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : null} Create Deal &amp; Lock Funds
+          </button>
+        )}
+      </div>
     </div>
   )
 }
