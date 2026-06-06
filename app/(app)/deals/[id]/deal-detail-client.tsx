@@ -115,6 +115,7 @@ export function DealDetailClient({ id }: { id: string }) {
   const milestones = deal.milestones ?? []
   const multiMilestone = milestones.length > 1
   const milestonesComplete = milestones.filter((m) => m.status === 'SETTLED').length
+  const activeCountdown = ['LOCKED', 'DELIVERED', 'JUDGING'].includes(deal.status)
 
   async function handleDeliver() {
     if (!token || !proof.trim()) { toast.error('Add delivery details first.'); return }
@@ -216,7 +217,7 @@ export function DealDetailClient({ id }: { id: string }) {
       </Link>
 
       {/* Stepper */}
-      <div className="glass mt-6 rounded-2xl border border-border p-6">
+      <UrgencyCard expiresAt={deal.expiresAt} active={activeCountdown} className="glass mt-6 rounded-2xl border border-border p-6">
         <div className="mb-6 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <span className={cn('h-2 w-2 rounded-full', wsStatus === 'connected' ? 'bg-success animate-pulse-dot' : 'bg-muted-foreground')} />
@@ -227,7 +228,7 @@ export function DealDetailClient({ id }: { id: string }) {
           <StatusBadge status={deal.status} />
         </div>
         <DealStepper status={deal.status} />
-      </div>
+      </UrgencyCard>
 
       {/* Header */}
       <header className="mt-8 flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
@@ -274,6 +275,62 @@ export function DealDetailClient({ id }: { id: string }) {
             <h2 className="font-mono text-xs uppercase tracking-widest text-gold">Deal Terms</h2>
             <p className="mt-3 whitespace-pre-wrap leading-relaxed text-foreground/90">{deal.terms}</p>
           </section>
+
+          {/* Insurance status — every deal above $500. Active shield if insured, nothing if not. */}
+          {deal.amount > 500 && deal.insured && (
+            <section className="glass flex items-center gap-3 rounded-2xl border border-gold/40 p-5">
+              <Shield className="h-6 w-6 shrink-0 text-gold" />
+              <div className="flex-1">
+                <h2 className="font-display text-lg font-medium text-foreground">Deal Insured</h2>
+                <p className="mt-0.5 text-sm text-muted-foreground">
+                  Protected against settlement failure or seller default
+                  {typeof deal.insuranceFee === 'number' && (
+                    <> · fee {formatUSD(deal.insuranceFee)}</>
+                  )}
+                  .
+                </p>
+              </div>
+              <span className="inline-flex items-center gap-1 rounded-full border border-gold/40 bg-gold/10 px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider text-gold">
+                Active
+              </span>
+            </section>
+          )}
+
+          {/* Milestone progress — every multi-milestone deal. X of Y complete with filled gold bar. */}
+          {multiMilestone && (
+            <section className="glass rounded-2xl border border-border p-6">
+              <div className="flex items-center justify-between">
+                <h2 className="inline-flex items-center gap-2 font-mono text-xs uppercase tracking-widest text-gold">
+                  <ListChecks className="h-3.5 w-3.5" /> Milestones
+                </h2>
+                <span className="font-mono text-[11px] uppercase tracking-wider text-muted-foreground">
+                  {milestonesComplete} of {milestones.length} complete
+                </span>
+              </div>
+              <div className="mt-3 h-2 overflow-hidden rounded-full bg-border">
+                <div
+                  className="h-full bg-gold transition-all duration-500"
+                  style={{ width: `${Math.round((milestonesComplete / milestones.length) * 100)}%` }}
+                />
+              </div>
+              <ul className="mt-4 space-y-2">
+                {milestones.map((m, i) => {
+                  const done = m.status === 'SETTLED'
+                  return (
+                    <li key={m.id} className="flex items-center justify-between gap-3 rounded-lg border border-border bg-surface/40 p-3">
+                      <div className="flex min-w-0 items-center gap-3">
+                        <span className={cn('flex h-6 w-6 shrink-0 items-center justify-center rounded-full border font-mono text-[11px]', done ? 'border-success/40 bg-success/10 text-success' : 'border-gold/40 bg-gold/10 text-gold')}>
+                          {done ? <Check className="h-3.5 w-3.5" /> : i + 1}
+                        </span>
+                        <span className="truncate text-sm text-foreground/90">{m.title || `Milestone ${i + 1}`}</span>
+                      </div>
+                      <span className="shrink-0 font-mono text-xs text-muted-foreground">{formatUSD(m.amount)}</span>
+                    </li>
+                  )
+                })}
+              </ul>
+            </section>
+          )}
 
           {/* Deal Health — LOCKED only */}
           {deal.status === 'LOCKED' && (
@@ -327,6 +384,23 @@ export function DealDetailClient({ id }: { id: string }) {
                         )}
                         {p.verdict && <span className="text-gold">{p.verdict}</span>}
                       </div>
+                      {/* Resend invitation on every unaccepted party slot */}
+                      {!p.accepted && (
+                        <div className="mt-3 flex items-center justify-between gap-2 border-t border-border pt-3">
+                          <span className="inline-flex items-center gap-1 font-mono text-[10px] uppercase tracking-wider text-amber-300">
+                            <Clock className="h-3 w-3" /> Invitation pending
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => handleResend(p)}
+                            disabled={resending === p.id}
+                            className="btn-press inline-flex items-center gap-1.5 rounded-md border border-gold/40 px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider text-gold transition-colors hover:bg-gold/10 disabled:opacity-50"
+                          >
+                            {resending === p.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+                            Resend
+                          </button>
+                        </div>
+                      )}
                     </li>
                   )
                 })}
@@ -373,9 +447,55 @@ export function DealDetailClient({ id }: { id: string }) {
       </div>
 
       {/* Dynamic action area */}
-      <div className="mt-6">
-        {/* Seller delivers when LOCKED */}
-        {deal.status === 'LOCKED' && isSeller && (
+      <div className="mt-6 space-y-6">
+        {/* Per-seller delivery — every multi-seller deal. Each seller gets their own section. */}
+        {deal.status === 'LOCKED' && multiSeller && (
+          <div className="space-y-6">
+            {sellerParties.map((p) => {
+              const mine = isPartySeller(p)
+              return (
+                <section key={p.id} className="glass rounded-2xl border border-border p-6">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h2 className="font-display text-xl font-medium text-foreground">
+                      {partyLabel(p, allParties)} delivery
+                      {mine && <span className="ml-2 font-mono text-xs uppercase tracking-wider text-muted-foreground">· you</span>}
+                    </h2>
+                    <span className={cn('inline-flex items-center gap-1 rounded-full border px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider', p.delivered ? 'border-success/40 bg-success/10 text-success' : 'border-border bg-surface/40 text-amber-300')}>
+                      {p.delivered ? <Check className="h-3 w-3" /> : <Clock className="h-3 w-3" />}
+                      {p.delivered ? 'Delivered' : 'Awaiting'}
+                    </span>
+                  </div>
+                  <p className="mt-1 break-all font-mono text-xs text-muted-foreground">{p.email}</p>
+                  {p.delivered && p.deliveryProof ? (
+                    <p className="mt-3 whitespace-pre-wrap rounded-lg border border-border bg-surface/40 p-3 text-sm leading-relaxed text-foreground/90">{p.deliveryProof}</p>
+                  ) : mine ? (
+                    <>
+                      <textarea
+                        value={partyProof[p.id] ?? ''}
+                        onChange={(e) => setPartyProof((prev) => ({ ...prev, [p.id]: e.target.value }))}
+                        rows={4}
+                        placeholder="Describe your delivered work, include links, repos, or notes…"
+                        className="mt-4 w-full rounded-lg border border-border bg-surface/60 p-3 text-foreground outline-none focus:border-gold"
+                      />
+                      <button
+                        onClick={() => handleDeliverParty(p.id)}
+                        disabled={busy}
+                        className="btn-press mt-4 inline-flex items-center gap-2 rounded-md bg-gold px-5 py-2.5 text-sm font-medium text-primary-foreground disabled:opacity-60"
+                      >
+                        {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />} Submit Delivery
+                      </button>
+                    </>
+                  ) : (
+                    <p className="mt-3 text-sm text-muted-foreground">Waiting for this seller to submit their delivery.</p>
+                  )}
+                </section>
+              )
+            })}
+          </div>
+        )}
+
+        {/* Single-seller delivery when LOCKED */}
+        {deal.status === 'LOCKED' && !multiSeller && isSeller && (
           <section className="glass rounded-2xl border border-border p-6">
             <h2 className="font-display text-2xl font-medium text-foreground">Submit your delivery</h2>
             <p className="mt-1 text-sm text-muted-foreground">Describe what you delivered and attach any supporting files.</p>
@@ -403,9 +523,58 @@ export function DealDetailClient({ id }: { id: string }) {
           </section>
         )}
 
-        {deal.status === 'LOCKED' && isBuyer && (
+        {deal.status === 'LOCKED' && !multiSeller && isBuyer && (
           <section className="glass rounded-2xl border border-border p-6 text-center">
             <p className="text-muted-foreground">Waiting for the seller to submit their delivery.</p>
+          </section>
+        )}
+
+        {/* Multi-buyer confirmation countdown — every deal awaiting co-buyer confirmation. */}
+        {multiBuyer && pendingBuyers.length > 0 && ['DELIVERED', 'JUDGING'].includes(deal.status) && (
+          <section className="glass rounded-2xl border border-amber-400/40 p-6">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h2 className="inline-flex items-center gap-2 font-display text-2xl font-medium text-foreground">
+                <Clock className="h-5 w-5 text-amber-300" /> Awaiting co-buyer confirmation
+              </h2>
+              <div className="text-right">
+                <p className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">Window closes in</p>
+                <Countdown to={deal.expiresAt} className="text-lg" />
+              </div>
+            </div>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {buyerParties.length - pendingBuyers.length} of {buyerParties.length} buyers have confirmed. All buyers must confirm before judgment proceeds.
+            </p>
+            <ul className="mt-4 space-y-2">
+              {buyerParties.map((p) => {
+                const mine = isPartySeller(p)
+                return (
+                  <li key={p.id} className={cn('flex items-center justify-between gap-3 rounded-lg border p-3', p.confirmed ? 'border-success/30 bg-success/5' : 'border-border bg-surface/40')}>
+                    <div className="min-w-0">
+                      <span className="text-sm text-foreground">{partyLabel(p, allParties)} {mine && <span className="text-muted-foreground">· you</span>}</span>
+                      <p className="break-all font-mono text-[11px] text-muted-foreground">{p.email}</p>
+                    </div>
+                    {p.confirmed ? (
+                      <span className="inline-flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-wider text-success">
+                        <Check className="h-3.5 w-3.5" /> Confirmed
+                      </span>
+                    ) : mine ? (
+                      <button
+                        type="button"
+                        onClick={() => handleConfirmBuyer(p.id)}
+                        disabled={busy}
+                        className="btn-press inline-flex items-center gap-1.5 rounded-md border border-gold/40 px-3 py-1.5 font-mono text-[11px] uppercase tracking-wider text-gold transition-colors hover:bg-gold/10 disabled:opacity-50"
+                      >
+                        {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />} Confirm
+                      </button>
+                    ) : (
+                      <span className="inline-flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-wider text-amber-400">
+                        <Clock className="h-3.5 w-3.5" /> Pending
+                      </span>
+                    )}
+                  </li>
+                )
+              })}
+            </ul>
           </section>
         )}
 
@@ -419,11 +588,14 @@ export function DealDetailClient({ id }: { id: string }) {
             {isBuyer && (
               <button
                 onClick={handleJudge}
-                disabled={busy}
+                disabled={busy || (multiBuyer && pendingBuyers.length > 0)}
                 className="btn-press mx-auto mt-5 inline-flex items-center gap-2 rounded-md bg-gold px-6 py-3 text-sm font-medium text-primary-foreground gold-glow disabled:opacity-60"
               >
                 {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Gavel className="h-4 w-4" />} Request Judgment
               </button>
+            )}
+            {isBuyer && multiBuyer && pendingBuyers.length > 0 && (
+              <p className="mt-2 font-mono text-[11px] text-amber-300">All co-buyers must confirm before judgment.</p>
             )}
           </section>
         )}
@@ -457,7 +629,19 @@ export function DealDetailClient({ id }: { id: string }) {
               <AppealPanel deal={deal} onUpdate={(d) => setDeal(d)} />
             )}
 
-            {deal.status === 'JUDGED' && !isWitness && (
+            {/* Multi-party settlement — adjustable per-seller splits with all-party confirmation. */}
+            {deal.status === 'JUDGED' && !isWitness && multi && (
+              <SettlementSplitter
+                deal={deal}
+                currentUserId={user?.id}
+                currentUserEmail={user?.email}
+                busy={busy}
+                onSettle={handleSettle}
+              />
+            )}
+
+            {/* Single-party settlement */}
+            {deal.status === 'JUDGED' && !isWitness && !multi && (
               <div className="flex flex-col items-center gap-3 text-center">
                 <button
                   onClick={handleSettle}
@@ -550,6 +734,22 @@ export function DealDetailClient({ id }: { id: string }) {
       </section>
     </div>
   )
+}
+
+function UrgencyCard({
+  expiresAt,
+  active,
+  className,
+  children,
+}: {
+  expiresAt: string
+  active: boolean
+  className?: string
+  children: React.ReactNode
+}) {
+  const { urgency } = useCountdown(expiresAt)
+  const critical = active && urgency === 'critical'
+  return <div className={cn(className, critical && 'danger-glow border-danger')}>{children}</div>
 }
 
 function DropZone({

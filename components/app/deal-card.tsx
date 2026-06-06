@@ -4,7 +4,7 @@ import Link from 'next/link'
 import { useEffect, useRef, useState } from 'react'
 import { ScrollText, ShieldCheck } from 'lucide-react'
 import { StatusBadge } from '@/components/status-badge'
-import { Countdown } from '@/components/countdown'
+import { Countdown, useCountdown } from '@/components/countdown'
 import { GavelScorePill } from '@/components/app/gavel-score'
 import { useWebSocket } from '@/lib/use-websocket'
 import { formatUSDT } from '@/lib/utils'
@@ -28,6 +28,9 @@ export function DealCard({ deal: initial, index = 0 }: { deal: Deal; index?: num
   })
 
   const isSettleable = ['LOCKED', 'DELIVERED', 'JUDGING'].includes(deal.status)
+  // Card border glows red when under 10 minutes remain on an active deal.
+  const { urgency } = useCountdown(deal.expiresAt)
+  const critical = isSettleable && urgency === 'critical'
   const sellerScore =
     deal.parties?.find((p) => p.role === 'seller')?.gavelScore ?? deterministicScore(deal.sellerEmail)
   const multi = isMultiParty(deal)
@@ -36,7 +39,7 @@ export function DealCard({ deal: initial, index = 0 }: { deal: Deal; index?: num
   return (
     <Link href={`/deals/${deal.id}`}>
       <article
-        className={`glass relative h-full rounded-xl border border-border p-5 transition-all hover:border-gold/30 ${flash ? 'animate-flash-gold' : ''}`}
+        className={`glass relative h-full rounded-xl border p-5 transition-all hover:border-gold/30 ${critical ? 'danger-glow border-danger' : 'border-border'} ${flash ? 'animate-flash-gold' : ''}`}
         style={{ animation: firstRef.current ? `fadeIn 0.5s ease ${index * 50}ms both` : undefined }}
       >
         <div className="flex items-start justify-between gap-3">
